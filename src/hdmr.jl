@@ -374,6 +374,85 @@ function tryfith!(coefspos::AbstractMatrix{T}, coefszero::AbstractMatrix{T}, j::
   end
 end
 
+
+"Fits a gamma lasso Positive Poisson regression counts[:,j] ~ covars saving the coefficients in coefs[:,j]"
+function glpos!(coefs::AbstractMatrix{T}, j::Int, covars::AbstractMatrix{T},counts::AbstractMatrix{V},μ; kwargs...) where {T<:AbstractFloat,V}
+  cj = vec(full(counts[:,j]))
+
+  # find positive y entries
+  ixpos = find(cj)
+  ypos = cj[ixpos]
+
+  if any(x->x>1, ypos)
+    μpos = μ[ixpos]
+
+    # regress
+    path = fit(GammaLassoPath,view(covars,ixpos,:),ypos,PositivePoisson(),LogProductLogLink(); offset=μpos, kwargs...)
+
+    # set coefs
+    coefs[:,j] = coef(path;select=:AICc)
+  else
+    # set coefs to zero
+    coefs[:,j] = zero(T)
+  end
+
+  nothing
+end
+
+"Fits a gamma lasso Binomial regression counts[:,j] ~ covars saving the coefficients in coefs[:,j]"
+function glzero!(coefs::AbstractMatrix{T}, j::Int, covars::AbstractMatrix{T},counts::AbstractMatrix{V},μ; kwargs...) where {T<:AbstractFloat,V}
+  cj = vec(full(counts[:,j]))
+
+  # find positive y entries
+  ixpos, Iy = getIy(cj)
+
+  if var(Iy) > zero(T)
+    # regress
+    path = fit(GammaLassoPath,covars,Iy,Binomial(),LogitLink(); offset=μ, kwargs...)
+
+    # set coefs
+    coefs[:,j] = coef(path;select=:AICc)
+  else
+    # set coefs to zero
+    coefs[:,j] = zero(T)
+  end
+
+  nothing
+end
+
+
+"Wrapper for glpos! that catches exceptions in which case it sets coefs to zero"
+function tryglpos!(coefs::AbstractMatrix{T}, j::Int, covars::AbstractMatrix{T},counts::AbstractMatrix{V}, μ;
+            showwarnings = false,
+            kwargs...) where {T<:AbstractFloat,V}
+  try
+    glpos!(coefs, j, covars, counts, μ; kwargs...)
+  catch e
+    showwarnings && warn("glpos failed on count dimension $j with frequencies $(sort(countmap(counts[:,j]))) and will return zero coefs ($e)")
+    # redudant ASSUMING COEFS ARRAY INTIAILLY FILLED WITH ZEROS, but can be uninitialized in serial case
+    for i=1:size(coefs,1)
+      coefs[i,j] = zero(T)
+    end
+  end
+  nothing
+end
+
+"Wrapper for glpos! that catches exceptions in which case it sets coefs to zero"
+function tryglzero!(coefs::AbstractMatrix{T}, j::Int, covars::AbstractMatrix{T},counts::AbstractMatrix{V}, μ;
+            showwarnings = false,
+            kwargs...) where {T<:AbstractFloat,V}
+  try
+    glzero!(coefs, j, covars, counts, μ; kwargs...)
+  catch e
+    showwarnings && warn("glzero failed on count dimension $j with frequencies $(sort(countmap(counts[:,j]))) and will return zero coefs ($e)")
+    # redudant ASSUMING COEFS ARRAY INTIAILLY FILLED WITH ZEROS, but can be uninitialized in serial case
+    for i=1:size(coefs,1)
+      coefs[i,j] = zero(T)
+    end
+  end
+  nothing
+end
+
 "Shorthand for fit(HDMR,covars,counts). See also [`fit(::HDMR)`](@ref)"
 function hdmr{T<:AbstractFloat,V}(covars::AbstractMatrix{T},counts::AbstractMatrix{V};
           inpos=1:size(covars,2), inzero=1:size(covars,2),
@@ -388,11 +467,72 @@ function hdmr{T<:AbstractFloat,V}(covars::AbstractMatrix{T},counts::AbstractMatr
   end
 end
 
+"Shorthand for fit(HDMR,covars,counts). See also [`fit(::HDMR)`](@ref)"
+function hdmrold{T<:AbstractFloat,V}(covars::AbstractMatrix{T},counts::AbstractMatrix{V};
+          inpos=1:size(covars,2), inzero=1:size(covars,2),
+          intercept=true,
+          parallel=true, local_cluster=true,
+          verbose=true, showwarnings=false,
+          kwargs...)
+  if local_cluster || !parallel
+    hdmr_local_cluster_old(covars,counts,inpos,inzero,intercept,parallel,verbose,showwarnings; kwargs...)
+  else
+    hdmr_remote_cluster(covars,counts,inpos,inzero,intercept,parallel,verbose,showwarnings; kwargs...)
+  end
+end
+
 """
 This version is built for local clusters and shares memory used by both inputs
 and outputs if run in parallel mode.
 """
 function hdmr_local_cluster{T<:AbstractFloat,V}(covars::AbstractMatrix{T},counts::AbstractMatrix{V},
+          inpos,inzero,intercept,parallel,verbose,showwarnings; kwargs...)
+  # get dimensions
+  n, d = size(counts)
+  n1,p = size(covars)
+  @assert n==n1 "counts and covars should have the same number of observations"
+
+  ppos = length(inpos)
+  pzero = length(inzero)
+
+  verbose && info("fitting $n observations on $d categories \n$ppos covariates for positive and $pzero for zero counts")
+
+  # add one coef for intercept
+  ncoefpos = ppos + (intercept ? 1 : 0)
+  ncoefzero = pzero + (intercept ? 1 : 0)
+
+  covars, counts, μ, n = shifters(covars, counts, showwarnings)
+
+  covarspos, covarszero = incovars(covars,inpos,inzero)
+
+  # fit separate GammaLassoPath's to each dimension of counts j=1:d and pick its min AICc segment
+  if parallel
+    verbose && info("distributed hurdle run on local cluster with $(nworkers()) nodes")
+    counts = convert(SharedArray,counts)
+    coefszero = SharedMatrix{T}(ncoefzero,d)
+    coefspos = SharedMatrix{T}(ncoefpos,d)
+    covarspos = convert(SharedArray,covarspos)
+    covarszero = convert(SharedArray,covarszero)
+    # μ = convert(SharedArray,μ) incompatible with GLM
+
+    @sync @parallel for j=1:d
+      tryglpos!(coefspos, j, covarspos, counts, μ; verbose=false, showwarnings=showwarnings, intercept=intercept, kwargs...)
+      tryglzero!(coefszero, j, covarszero, counts, μ; verbose=false, showwarnings=showwarnings, intercept=intercept, kwargs...)
+    end
+  else
+    verbose && info("serial hurdle run on a single node")
+    coefszero = Matrix{T}(ncoefzero,d)
+    coefspos = Matrix{T}(ncoefpos,d)
+    for j=1:d
+      tryglpos!(coefspos, j, covarspos, counts, μ; verbose=false, showwarnings=showwarnings, intercept=intercept, kwargs...)
+      tryglzero!(coefszero, j, covarszero, counts, μ; verbose=false, showwarnings=showwarnings, intercept=intercept, kwargs...)
+    end
+  end
+
+  HDMRCoefs(coefspos, coefszero, intercept, n, d, inpos, inzero)
+end
+
+function hdmr_local_cluster_old{T<:AbstractFloat,V}(covars::AbstractMatrix{T},counts::AbstractMatrix{V},
           inpos,inzero,intercept,parallel,verbose,showwarnings; kwargs...)
   # get dimensions
   n, d = size(counts)
